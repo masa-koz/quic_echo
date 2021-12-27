@@ -2,6 +2,7 @@ extern crate os_socketaddr;
 
 use os_socketaddr::OsSocketAddr;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use winapi::um::winbase::INFINITE;
 use windows::{
     core::*, Win32::Foundation::*, Win32::NetworkManagement::IpHelper::*,
     Win32::Networking::WinSock::*, Win32::System::Threading::*, Win32::System::IO::*,
@@ -74,7 +75,7 @@ impl EchoServer {
                 IPPROTO_UDP,
                 std::ptr::null_mut(),
                 0,
-                0,
+                WSA_FLAG_OVERLAPPED,
             );
             if socket == INVALID_SOCKET {
                 panic!("WSASocket");
@@ -96,7 +97,7 @@ impl EchoServer {
                         OffsetHigh: 0,
                     },
                 },
-                hEvent: CreateEventA(std::ptr::null_mut(), true, false, None),
+                hEvent: CreateEventA(std::ptr::null_mut(), false, false, None),
                 Internal: 0,
                 InternalHigh: 0,
             };
@@ -135,13 +136,34 @@ fn main() -> Result<()> {
         let mut server = EchoServer::new(addr);
         server.overlapped.hEvent.ok()?;
 
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4567);
+        let mut server1 = EchoServer::new(addr);
+        server1.overlapped.hEvent.ok()?;
+
+        server.recv();
+        server1.recv();
+
         loop {
-            server.recv();
+            let handles: [HANDLE; 2] = [server.overlapped.hEvent, server1.overlapped.hEvent];
 
-            let wait_ok = WaitForSingleObject(server.overlapped.hEvent, 2000);
-            assert!(wait_ok == WAIT_OBJECT_0);
-
-            server.send();
+            match WaitForMultipleObjects(2, handles.as_ptr(), false, INFINITE) {
+                0 => {
+                    println!("server recv");
+                    server.send();
+                    server.recv();
+                }
+                1 => {
+                    println!("server1 recv");
+                    server1.send();
+                    server1.recv();
+                }
+                WAIT_TIMEOUT => {
+                    println!("timeout");
+                }
+                _ => {
+                    println!("error");
+                }
+            }
         }
 
         WSACleanup();
