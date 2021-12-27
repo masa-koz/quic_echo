@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dependencies]
+os_socketaddr = "0.2.0"
+winapi = { version = "0.3", features = ["winuser"] }
+
 [dependencies.windows]
 version = "0.29"
 features = [
@@ -12,4 +16,5 @@ features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
+    "Win32_System_IO",
 ]

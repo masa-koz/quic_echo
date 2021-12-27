@@ -1,3 +1,7 @@
+extern crate os_socketaddr;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use os_socketaddr::OsSocketAddr;
 use windows::{
     core::*, Win32::Foundation::*, Win32::NetworkManagement::IpHelper::*,
     Win32::Networking::WinSock::*,
@@ -31,21 +35,34 @@ fn main() -> Result<()> {
             panic!("WSASocket");
         }
 
-        let addr = SOCKADDR_IN {
-            sin_family: AF_INET as u16,
-            sin_port: 3456u16.to_be(),
-            sin_addr: IN_ADDR {
-                S_un: IN_ADDR_0 {
-                    S_un_b: IN_ADDR_0_0 {
-                        s_b1: 0,
-                        s_b2: 0,
-                        s_b3: 0,
-                        s_b4: 0
-                    }
-                }
-            },
-            sin_zero: [0; 8]
-        };
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3456);
+        let addr: OsSocketAddr = addr.into();
+        bind(
+            socket,
+            std::mem::transmute::<*const winapi::shared::ws2def::SOCKADDR, *const SOCKADDR>(addr.as_ptr()),
+            addr.len()
+        );
+
+        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 3456);
+        let dest: OsSocketAddr = addr.into();
+        let mut buf: [u8; 1024] = [0; 1024];
+        let mut bufs: [WSABUF; 1] = [WSABUF {
+            len: 1024,
+            buf: PSTR(buf.as_mut_ptr())
+        }];
+        let mut numberofbytessent: u32 = 0;
+ 
+        let ret = WSASendTo(
+            socket,
+            bufs.as_mut_ptr(),
+            1,
+            &mut numberofbytessent,
+            0,
+            std::mem::transmute::<*const winapi::shared::ws2def::SOCKADDR, *const SOCKADDR>(dest.as_ptr()),
+            dest.len(),
+            std::ptr::null_mut(),
+            None
+        );
 
         WSACleanup();
     }
