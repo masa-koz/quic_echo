@@ -43,18 +43,33 @@ fn main() -> Result<()> {
             addr.len()
         );
 
-        let dest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 3456);
-        let dest: OsSocketAddr = addr.into();
+        let mut dest: OsSocketAddr = addr.into();
+        let mut destlen = addr.capacity();
         let mut buf: [u8; 1024] = [0; 1024];
-        let mut bufs: [WSABUF; 1] = [WSABUF {
+        let mut wsabuf = WSABUF {
             len: 1024,
             buf: PSTR(buf.as_mut_ptr())
-        }];
+        };
+        let mut numberOfBytesRecvd: u32 = 0;
+        let mut flags: u32 = 0;
+
+        let ret = WSARecvFrom(
+            socket,
+            &mut wsabuf,
+            1u32,
+            &mut numberOfBytesRecvd,
+            &mut flags,
+            std::mem::transmute::<*mut winapi::shared::ws2def::SOCKADDR, *mut SOCKADDR>(dest.as_mut_ptr()),
+            &mut destlen,
+            std::ptr::null_mut(),
+            None
+        );
+        
         let mut numberofbytessent: u32 = 0;
  
         let ret = WSASendTo(
             socket,
-            bufs.as_mut_ptr(),
+            &mut wsabuf,
             1,
             &mut numberofbytessent,
             0,
