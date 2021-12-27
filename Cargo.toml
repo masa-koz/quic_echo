@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 os_socketaddr = "0.2.0"
+quiche = {git = "https://github.com/cloudflare/quiche.git"}
+ring = "0.16"
 winapi = { version = "0.3", features = ["winuser"] } # SOCKADDRの変換が依存
 
 [dependencies.windows]
