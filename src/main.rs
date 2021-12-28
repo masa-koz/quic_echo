@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::f32::consts::E;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 extern crate os_socketaddr;
@@ -208,6 +209,15 @@ impl QuicServer {
     }
 }
 
+enum EchoServerError {
+    Discarded,
+    Abort,
+    RecvPending,
+    SendPending,
+}
+
+type EchoServerResult<T> = std::result::Result<T, EchoServerError>;
+
 struct EchoServer {
     socket: SOCKET,
     buf: [u8; 65535],
@@ -226,7 +236,7 @@ struct EchoServer {
 }
 
 impl EchoServer {
-    fn recv(&mut self) {
+    fn recv(&mut self) -> EchoServerResult<()> {
         loop {
             if !self.recving {
                 if !recvfrom(
@@ -238,7 +248,7 @@ impl EchoServer {
                     &mut self.recv_overlapped,
                 ) {
                     self.recving = true;
-                    return;
+                    return Err(EchoServerError::RecvPending);
                 }
             }
             self.recving = false;
@@ -256,12 +266,33 @@ impl EchoServer {
             };
             self.recv_len = cbTransfer;
             println!("WSARecvFrom()'s cbTransfer={}", cbTransfer);
-            self.process_packets();
-            self.send_packets();
+            match self.process_packets() {
+                Ok(()) => {
+                    self.send_packets();
+                    self.remove_closed_connections();
+                }
+                Err(EchoServerError::Discarded) => {
+                    self.remove_closed_connections();
+                    continue;
+                }
+                Err(EchoServerError::SendPending) | Err(_) => {
+                    self.remove_closed_connections();
+                    recvfrom(
+                        self.socket,
+                        &mut self.buf,
+                        65535,
+                        &mut self.from,
+                        &mut self.from_len,
+                        &mut self.recv_overlapped,
+                    );
+                    break;
+                }
+            }
         }
+        Ok(())
     }
 
-    fn send_finish(&mut self) {
+    fn send_finish(&mut self) -> EchoServerResult<()> {
         assert!(self.sending);
 
         let mut cbTransfer = 0;
@@ -277,16 +308,17 @@ impl EchoServer {
         };
         println!("WSASendTo()'s cbTransfer={}", cbTransfer);
         self.sending = false;
+        Ok(())
     }
 
-    fn process_packets(&mut self) -> bool {
+    fn process_packets(&mut self) -> EchoServerResult<()> {
         let pkt_buf = &mut self.buf[..(self.recv_len as usize)];
         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
 
             Err(e) => {
                 println!("Parsing packet header failed: {:?}", e);
-                return true;
+                return Err(EchoServerError::Discarded);
             }
         };
 
@@ -319,13 +351,13 @@ impl EchoServer {
                                 &mut self.send_overlapped,
                             ) {
                                 self.sending = true;
-                                return false;
+                                return Err(EchoServerError::SendPending);
                             }
                         }
-                        return true;
+                        return Ok(());
                     }
                     Err(_) => {
-                        return false;
+                        return Err(EchoServerError::Discarded);
                     }
                 }
             } else {
@@ -340,13 +372,13 @@ impl EchoServer {
             self.from.into_addr().unwrap(),
             pkt_buf,
             &mut client.conn,
-            &mut self.stream_buf
+            &mut self.stream_buf,
         );
 
-        return true;
+        Ok(())
     }
 
-    fn send_packets(&mut self) {
+    fn send_packets(&mut self) -> EchoServerResult<()> {
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
@@ -357,14 +389,14 @@ impl EchoServer {
 
                     Err(quiche::Error::Done) => {
                         println!("{} done writing", client.conn.trace_id());
-                        break;
+                        return Err(EchoServerError::Abort);
                     }
 
                     Err(e) => {
                         println!("{} send failed: {:?}", client.conn.trace_id(), e);
 
                         client.conn.close(false, 0x1, b"fail").ok();
-                        break;
+                        return Err(EchoServerError::Abort);
                     }
                 };
 
@@ -377,16 +409,21 @@ impl EchoServer {
                         &mut self.send_overlapped,
                     ) {
                         self.sending = true;
-                        break;
+                        return Err(EchoServerError::SendPending);
                     }
                 }
 
                 println!("{} written {} bytes", client.conn.trace_id(), write);
             }
         }
+        Ok(())
+    }
+
+    fn remove_closed_connections(&mut self) -> EchoServerResult<()> {
         // Garbage collect closed connections.
+        // XXX CCされてもなぜか回収されない。quicheのバグ？
         self.clients.retain(|_, ref mut c| {
-            println!("Collecting garbage");
+            println!("Collecting garbage: {}", c.conn.trace_id());
 
             if c.conn.is_closed() {
                 println!(
@@ -398,6 +435,7 @@ impl EchoServer {
 
             !c.conn.is_closed()
         });
+        Ok(())
     }
 
     fn new(addr: SocketAddr) -> EchoServer {
