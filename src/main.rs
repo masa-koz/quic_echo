@@ -19,10 +19,10 @@ struct EchoServer {
     socket: SOCKET,
     buf: [u8; 65535],
     out: [u8; 1350],
-    dest: OsSocketAddr,
-    destlen: i32,
-    numberOfBytesRecvd: u32,
-    numberOfBytesSend: u32,
+    from: OsSocketAddr,
+    from_len: i32,
+    recv_len: u32,
+    send_len: u32,
     recving: bool,
     sending: bool,
     recv_overlapped: OVERLAPPED,
@@ -40,8 +40,8 @@ impl EchoServer {
                     self.socket,
                     &mut self.buf,
                     65535,
-                    &mut self.dest,
-                    &mut self.destlen,
+                    &mut self.from,
+                    &mut self.from_len,
                     &mut self.recv_overlapped,
                 ) {
                     self.recving = true;
@@ -61,8 +61,8 @@ impl EchoServer {
                     &mut dwFlags,
                 )
             };
-            self.numberOfBytesRecvd = cbTransfer;
-            println!("WSARecvFrom's cbTransfer={}", cbTransfer);
+            self.recv_len = cbTransfer;
+            println!("WSARecvFrom()'s cbTransfer={}", cbTransfer);
             self.process_packets();
             self.send_packets();
         }
@@ -82,13 +82,12 @@ impl EchoServer {
                 &mut dwFlags,
             )
         };
-        println!("WSASendTo's cbTransfer={}", cbTransfer);
+        println!("WSASendTo()'s cbTransfer={}", cbTransfer);
         self.sending = false;
     }
 
     fn process_packets(&mut self) -> bool {
-        let len: usize = self.numberOfBytesRecvd as usize;
-        let pkt_buf = &mut self.buf[..len];
+        let pkt_buf = &mut self.buf[..(self.recv_len as usize)];
         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
 
@@ -117,7 +116,7 @@ impl EchoServer {
                             self.socket,
                             &mut self.out,
                             write,
-                            self.dest,
+                            self.from,
                             &mut self.send_overlapped,
                         ) {
                             self.sending = true;
@@ -139,7 +138,7 @@ impl EchoServer {
                 if token.is_empty() {
                     println!("Doing stateless retry");
 
-                    let new_token = mint_token(&hdr, &self.dest.into_addr().unwrap());
+                    let new_token = mint_token(&hdr, &self.from.into_addr().unwrap());
 
                     let write = quiche::retry(
                         &hdr.scid,
@@ -156,7 +155,7 @@ impl EchoServer {
                             self.socket,
                             &mut self.out,
                             write,
-                            self.dest,
+                            self.from,
                             &mut self.send_overlapped,
                         ) {
                             self.sending = true;
@@ -166,7 +165,7 @@ impl EchoServer {
                     return true;
                 }
 
-                let odcid = validate_token(&self.dest.into_addr().unwrap(), token);
+                let odcid = validate_token(&self.from.into_addr().unwrap(), token);
 
                 // The token was not valid, meaning the retry failed, so
                 // drop the packet.
@@ -189,7 +188,7 @@ impl EchoServer {
                 let conn = quiche::accept(
                     &scid,
                     odcid.as_ref(),
-                    self.dest.into_addr().unwrap(),
+                    self.from.into_addr().unwrap(),
                     &mut self.quic_config,
                 )
                 .unwrap();
@@ -208,7 +207,7 @@ impl EchoServer {
             };
 
         let recv_info = quiche::RecvInfo {
-            from: self.dest.into_addr().unwrap(),
+            from: self.from.into_addr().unwrap(),
         };
 
         // Process potentially coalesced packets.
@@ -271,7 +270,7 @@ impl EchoServer {
                         self.socket,
                         &mut self.out,
                         write as u32,
-                        self.dest,
+                        self.from,
                         &mut self.send_overlapped,
                     ) {
                         self.sending = true;
@@ -310,7 +309,7 @@ impl EchoServer {
             )
         };
         if socket == INVALID_SOCKET {
-            panic!("WSASocket");
+            panic!("WSASocket()");
         }
 
         let addr: OsSocketAddr = addr.into();
@@ -377,10 +376,10 @@ impl EchoServer {
             socket: socket,
             buf: [0; 65535],
             out: [0; 1350],
-            dest: OsSocketAddr::new(),
-            destlen: 0,
-            numberOfBytesRecvd: 0,
-            numberOfBytesSend: 0,
+            from: OsSocketAddr::new(),
+            from_len: 0,
+            recv_len: 0,
+            send_len: 0,
             recv_overlapped: recv_overlapped,
             send_overlapped: send_overlapped,
             recving: false,
@@ -488,7 +487,7 @@ fn recvfrom(
         let ret = unsafe { WSAGetLastError() };
         match ret {
             WSA_IO_PENDING => {
-                println!("WSA_IO_PENDING");
+                println!("WSARecvFrom() return WSA_IO_PENDING");
                 return false;
             }
             _ => {
@@ -528,17 +527,17 @@ fn sendto(
     if ret == 0 {
         let ret = unsafe { WaitForSingleObject(overlapped.hEvent, 0) };
         assert!(ret == WAIT_OBJECT_0);
-        println!("WSASend's numberofbytessent={}", numberofbytessent);
+        println!("WSASend()'s numberofbytessent={}", numberofbytessent);
         return true;
     } else {
         let ret = unsafe { WSAGetLastError() };
         match ret {
             WSA_IO_PENDING => {
-                println!("WSA_IO_PENDING");
+                println!("WSASendTo() return WSA_IO_PENDING");
                 return false;
             }
             _ => {
-                panic!("WSARecvFrom()={}", ret);
+                panic!("WSASendTo()={}", ret);
             }
         }
     }
@@ -558,7 +557,7 @@ fn main() -> Result<()> {
         };
         let ret = WSAStartup(wVersionRequested, &mut wsaData);
         if ret != 0 {
-            panic!("WSAStartup");
+            panic!("WSAStartup()");
         }
     }
 
