@@ -23,6 +23,7 @@ struct EchoServer {
     destlen: i32,
     numberOfBytesRecvd: u32,
     numberOfBytesSend: u32,
+    recving: bool,
     overlapped: OVERLAPPED,
     quic_config: quiche::Config,
     conn_id_seed: ring::hmac::Key,
@@ -30,6 +31,41 @@ struct EchoServer {
 }
 
 impl EchoServer {
+    fn recv(&mut self) {
+        loop {
+            if !self.recving {
+                if !recvfrom(
+                    self.socket,
+                    &mut self.buf,
+                    65535,
+                    &mut self.dest,
+                    &mut self.destlen,
+                    &mut self.overlapped,
+                ) {
+                    self.recving = true;
+                    return;
+                }
+            }
+            self.recving = false;
+    
+            let mut cbTransfer = 0;
+            let mut dwFlags = 0;
+            unsafe {
+                WSAGetOverlappedResult(
+                    self.socket,
+                    &self.overlapped,
+                    &mut cbTransfer,
+                    true,
+                    &mut dwFlags,
+                )
+            };
+            self.numberOfBytesRecvd = cbTransfer;
+            println!("cbTransfer={}", cbTransfer);
+            self.process_packets();
+            self.send_packets();
+        }
+    }
+
     fn process_packets(&mut self) -> bool {
         let mut cbTransfer = 0;
         let mut dwFlags = 0;
@@ -318,6 +354,7 @@ impl EchoServer {
             numberOfBytesRecvd: 0,
             numberOfBytesSend: 0,
             overlapped: overlapped,
+            recving: false,
             quic_config: config,
             conn_id_seed: conn_id_seed,
             clients: ClientMap::new(),
@@ -502,87 +539,20 @@ fn main() -> Result<()> {
     server.overlapped.hEvent.ok()?;
     server1.overlapped.hEvent.ok()?;
 
-    recvfrom(
-        server.socket,
-        &mut server.buf,
-        65535,
-        &mut server.dest,
-        &mut server.destlen,
-        &mut server.overlapped,
-    );
-    recvfrom(
-        server1.socket,
-        &mut server1.buf,
-        65535,
-        &mut server1.dest,
-        &mut server1.destlen,
-        &mut server1.overlapped,
-    );
+    server.recv();
+    server1.recv();
+
     loop {
         let handles: [HANDLE; 2] = [server.overlapped.hEvent, server1.overlapped.hEvent];
 
         match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), false, INFINITE) } {
             0 => {
                 println!("server recv");
-                loop {
-                    let mut cbTransfer = 0;
-                    let mut dwFlags = 0;
-                    unsafe {
-                        WSAGetOverlappedResult(
-                            server.socket,
-                            &server.overlapped,
-                            &mut cbTransfer,
-                            true,
-                            &mut dwFlags,
-                        )
-                    };
-                    server.numberOfBytesRecvd = cbTransfer;
-                    println!("cbTransfer={}", cbTransfer);
-                    server.process_packets();
-                    server.send_packets();
-
-                    if !recvfrom(
-                        server.socket,
-                        &mut server.buf,
-                        65535,
-                        &mut server.dest,
-                        &mut server.destlen,
-                        &mut server.overlapped,
-                    ) {
-                        break;
-                    }
-                }
+                server.recv();
             }
             1 => {
                 println!("server1 recv");
-                loop {
-                    let mut cbTransfer = 0;
-                    let mut dwFlags = 0;
-                    unsafe {
-                        WSAGetOverlappedResult(
-                            server1.socket,
-                            &server1.overlapped,
-                            &mut cbTransfer,
-                            true,
-                            &mut dwFlags,
-                        )
-                    };
-                    server1.numberOfBytesRecvd = cbTransfer;
-                    println!("cbTransfer={}", cbTransfer);
-                    server1.process_packets();
-                    server1.send_packets();
-
-                    if !recvfrom(
-                        server1.socket,
-                        &mut server1.buf,
-                        65535,
-                        &mut server1.dest,
-                        &mut server1.destlen,
-                        &mut server1.overlapped,
-                    ) {
-                        break;
-                    }
-                }
+                server1.recv();
             }
             WAIT_TIMEOUT => {
                 println!("timeout");
