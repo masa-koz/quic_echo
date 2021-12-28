@@ -15,6 +15,140 @@ struct Client {
 }
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
+enum QuicServerError {
+    VersionNegotiation,
+    StatelessRetry,
+    ProtocolError,
+}
+
+type QuicServerResult<T> = std::result::Result<T, QuicServerError>;
+
+struct QuicServer {
+    config: quiche::Config,
+    keylog: Option<std::fs::File>,
+    conn_id_seed: ring::hmac::Key,
+}
+
+impl QuicServer {
+    fn handle_handshake(
+        &mut self,
+        from: &SocketAddr,
+        hdr: &quiche::Header,
+        conn_id: &quiche::ConnectionId,
+        out: &mut [u8],
+        write: &mut usize,
+    ) -> QuicServerResult<Client> {
+        if hdr.ty != quiche::Type::Initial {
+            println!("Packet is not Initial");
+            return Err(QuicServerError::ProtocolError);
+        }
+        if !quiche::version_is_supported(hdr.version) {
+            println!("Doing version negotiation");
+
+            *write = quiche::negotiate_version(&hdr.scid, &hdr.dcid, out).unwrap();
+            return Err(QuicServerError::VersionNegotiation);
+        }
+
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        scid.copy_from_slice(&conn_id);
+
+        let scid = quiche::ConnectionId::from_ref(&scid);
+
+        // Token is always present in Initial packets.
+        let token = hdr.token.as_ref().unwrap();
+
+        // Do stateless retry if the client didn't send a token.
+        if token.is_empty() {
+            println!("Doing stateless retry");
+
+            let new_token = mint_token(&hdr, from);
+
+            *write =
+                quiche::retry(&hdr.scid, &hdr.dcid, &scid, &new_token, hdr.version, out).unwrap();
+
+            return Err(QuicServerError::StatelessRetry);
+        }
+
+        let odcid = validate_token(from, token);
+
+        // The token was not valid, meaning the retry failed, so
+        // drop the packet.
+        if odcid.is_none() {
+            println!("Invalid address validation token");
+            return Err(QuicServerError::ProtocolError);
+        }
+
+        if scid.len() != hdr.dcid.len() {
+            println!("Invalid destination connection ID");
+            return Err(QuicServerError::ProtocolError);
+        }
+
+        // Reuse the source connection ID we sent in the Retry packet,
+        // instead of changing it again.
+        let scid = hdr.dcid.clone();
+
+        println!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
+
+        let mut conn = quiche::accept(&scid, odcid.as_ref(), *from, &mut self.config).unwrap();
+
+        if let Some(keylog) = &mut self.keylog {
+            if let Ok(keylog) = keylog.try_clone() {
+                println!("{:?}", keylog);
+                conn.set_keylog(Box::new(keylog));
+            }
+        }
+
+        Ok(Client { conn })
+    }
+
+    fn new() -> QuicServer {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("src/cert.crt")
+            .unwrap();
+        config.load_priv_key_from_pem_file("src/cert.key").unwrap();
+
+        config
+            .set_application_protos(
+                b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9\x06sample",
+            )
+            .unwrap();
+
+        config.set_max_idle_timeout(5000);
+        config.set_max_recv_udp_payload_size(1350);
+        config.set_max_send_udp_payload_size(1350);
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+        config.set_disable_active_migration(true);
+        config.enable_early_data();
+
+        let mut keylog = None;
+        if let Some(keylog_path) = std::env::var_os("SSLKEYLOGFILE") {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(keylog_path)
+                .unwrap();
+
+            keylog = Some(file);
+
+            config.log_keys();
+        }
+        let rng = ring::rand::SystemRandom::new();
+        let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+
+        QuicServer {
+            config: config,
+            keylog: keylog,
+            conn_id_seed: conn_id_seed,
+        }
+    }
+}
+
 struct EchoServer {
     socket: SOCKET,
     buf: [u8; 65535],
@@ -22,15 +156,13 @@ struct EchoServer {
     from: OsSocketAddr,
     from_len: i32,
     recv_len: u32,
-    send_len: u32,
+    send_len: usize,
     recving: bool,
     sending: bool,
     recv_overlapped: OVERLAPPED,
     send_overlapped: OVERLAPPED,
-    quic_config: quiche::Config,
-    keylog: Option<std::fs::File>,
-    conn_id_seed: ring::hmac::Key,
     clients: ClientMap,
+    quic_server: QuicServer,
 }
 
 impl EchoServer {
@@ -98,114 +230,44 @@ impl EchoServer {
             }
         };
 
-        let conn_id = ring::hmac::sign(&self.conn_id_seed, &hdr.dcid);
+        let conn_id = ring::hmac::sign(&self.quic_server.conn_id_seed, &hdr.dcid);
         let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
         let conn_id = conn_id.to_vec().into();
         let client =
             if !self.clients.contains_key(&hdr.dcid) && !self.clients.contains_key(&conn_id) {
-                if hdr.ty != quiche::Type::Initial {
-                    println!("Packet is not Initial");
-                    return true;
-                }
-                if !quiche::version_is_supported(hdr.version) {
-                    println!("Doing version negotiation");
+                match self.quic_server.handle_handshake(
+                    &self.from.into_addr().unwrap(),
+                    &hdr,
+                    &conn_id,
+                    &mut self.out,
+                    &mut self.send_len,
+                ) {
+                    Ok(client) => {
+                        self.clients.insert(hdr.dcid.clone(), client);
 
-                    let write = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut self.out)
-                        .unwrap() as u32;
-                    if !self.sending {
-                        if !sendto(
-                            self.socket,
-                            &mut self.out,
-                            write,
-                            self.from,
-                            &mut self.send_overlapped,
-                        ) {
-                            self.sending = true;
-                            return false;
+                        self.clients.get_mut(&hdr.dcid).unwrap()
+                    }
+                    Err(QuicServerError::VersionNegotiation)
+                    | Err(QuicServerError::StatelessRetry)
+                    | Err(QuicServerError::ProtocolError) => {
+                        if !self.sending {
+                            if !sendto(
+                                self.socket,
+                                &mut self.out,
+                                self.send_len as u32,
+                                self.from.into(),
+                                &mut self.send_overlapped,
+                            ) {
+                                self.sending = true;
+                                return false;
+                            }
                         }
+                        return true;
                     }
-                    return true;
-                }
-
-                let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                scid.copy_from_slice(&conn_id);
-
-                let scid = quiche::ConnectionId::from_ref(&scid);
-
-                // Token is always present in Initial packets.
-                let token = hdr.token.as_ref().unwrap();
-
-                // Do stateless retry if the client didn't send a token.
-                if token.is_empty() {
-                    println!("Doing stateless retry");
-
-                    let new_token = mint_token(&hdr, &self.from.into_addr().unwrap());
-
-                    let write = quiche::retry(
-                        &hdr.scid,
-                        &hdr.dcid,
-                        &scid,
-                        &new_token,
-                        hdr.version,
-                        &mut self.out,
-                    )
-                    .unwrap() as u32;
-
-                    if !self.sending {
-                        if !sendto(
-                            self.socket,
-                            &mut self.out,
-                            write,
-                            self.from,
-                            &mut self.send_overlapped,
-                        ) {
-                            self.sending = true;
-                            return false;
-                        }
-                    }
-                    return true;
-                }
-
-                let odcid = validate_token(&self.from.into_addr().unwrap(), token);
-
-                // The token was not valid, meaning the retry failed, so
-                // drop the packet.
-                if odcid.is_none() {
-                    println!("Invalid address validation token");
-                    return true;
-                }
-
-                if scid.len() != hdr.dcid.len() {
-                    println!("Invalid destination connection ID");
-                    return true;
-                }
-
-                // Reuse the source connection ID we sent in the Retry packet,
-                // instead of changing it again.
-                let scid = hdr.dcid.clone();
-
-                println!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
-
-                let mut conn = quiche::accept(
-                    &scid,
-                    odcid.as_ref(),
-                    self.from.into_addr().unwrap(),
-                    &mut self.quic_config,
-                )
-                .unwrap();
-
-                if let Some(keylog) = &mut self.keylog {
-                    if let Ok(keylog) = keylog.try_clone() {
-                        println!("{:?}", keylog);
-                        conn.set_keylog(Box::new(keylog));
+                    Err(_) => {
+                        return false;
                     }
                 }
-
-                let client = Client { conn };
-
-                self.clients.insert(scid.clone(), client);
-
-                self.clients.get_mut(&scid).unwrap()
             } else {
                 match self.clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
@@ -248,13 +310,13 @@ impl EchoServer {
 
                     let written = match client.conn.stream_send(s, stream_buf, true) {
                         Ok(v) => v,
-            
+
                         Err(quiche::Error::Done) => 0,
-            
+
                         Err(e) => {
                             println!("{} stream send failed {:?}", client.conn.trace_id(), e);
                             break;
-                        },
+                        }
                     };
                     println!(
                         "{} write into stream {} {} bytes",
@@ -372,43 +434,6 @@ impl EchoServer {
             InternalHigh: 0,
         };
 
-        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-        config
-            .load_cert_chain_from_pem_file("src/cert.crt")
-            .unwrap();
-        config.load_priv_key_from_pem_file("src/cert.key").unwrap();
-
-        config
-            .set_application_protos(b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9\x06sample")
-            .unwrap();
-
-        config.set_max_idle_timeout(5000);
-        config.set_max_recv_udp_payload_size(1350);
-        config.set_max_send_udp_payload_size(1350);
-        config.set_initial_max_data(10_000_000);
-        config.set_initial_max_stream_data_bidi_local(1_000_000);
-        config.set_initial_max_stream_data_bidi_remote(1_000_000);
-        config.set_initial_max_stream_data_uni(1_000_000);
-        config.set_initial_max_streams_bidi(100);
-        config.set_initial_max_streams_uni(100);
-        config.set_disable_active_migration(true);
-        config.enable_early_data();
-
-        let mut keylog = None;
-        if let Some(keylog_path) = std::env::var_os("SSLKEYLOGFILE") {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(keylog_path)
-                .unwrap();
-    
-            keylog = Some(file);
-    
-            config.log_keys();
-        }
-        let rng = ring::rand::SystemRandom::new();
-        let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
-
         EchoServer {
             socket: socket,
             buf: [0; 65535],
@@ -421,9 +446,7 @@ impl EchoServer {
             send_overlapped: send_overlapped,
             recving: false,
             sending: false,
-            quic_config: config,
-            keylog: keylog,
-            conn_id_seed: conn_id_seed,
+            quic_server: QuicServer::new(),
             clients: ClientMap::new(),
         }
     }
