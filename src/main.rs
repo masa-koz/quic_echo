@@ -28,6 +28,7 @@ struct EchoServer {
     recv_overlapped: OVERLAPPED,
     send_overlapped: OVERLAPPED,
     quic_config: quiche::Config,
+    keylog: Option<std::fs::File>,
     conn_id_seed: ring::hmac::Key,
     clients: ClientMap,
 }
@@ -185,13 +186,20 @@ impl EchoServer {
 
                 println!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(
+                let mut conn = quiche::accept(
                     &scid,
                     odcid.as_ref(),
                     self.from.into_addr().unwrap(),
                     &mut self.quic_config,
                 )
                 .unwrap();
+
+                if let Some(keylog) = &mut self.keylog {
+                    if let Ok(keylog) = keylog.try_clone() {
+                        println!("{:?}", keylog);
+                        conn.set_keylog(Box::new(keylog));
+                    }
+                }
 
                 let client = Client { conn };
 
@@ -287,7 +295,7 @@ impl EchoServer {
                         self.socket,
                         &mut self.out,
                         write as u32,
-                        self.from,
+                        send_info.to.into(),
                         &mut self.send_overlapped,
                     ) {
                         self.sending = true;
@@ -371,7 +379,7 @@ impl EchoServer {
         config.load_priv_key_from_pem_file("src/cert.key").unwrap();
 
         config
-            .set_application_protos(b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9")
+            .set_application_protos(b"\x0ahq-interop\x05hq-29\x05hq-28\x05hq-27\x08http/0.9\x06sample")
             .unwrap();
 
         config.set_max_idle_timeout(5000);
@@ -386,6 +394,18 @@ impl EchoServer {
         config.set_disable_active_migration(true);
         config.enable_early_data();
 
+        let mut keylog = None;
+        if let Some(keylog_path) = std::env::var_os("SSLKEYLOGFILE") {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(keylog_path)
+                .unwrap();
+    
+            keylog = Some(file);
+    
+            config.log_keys();
+        }
         let rng = ring::rand::SystemRandom::new();
         let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
@@ -402,6 +422,7 @@ impl EchoServer {
             recving: false,
             sending: false,
             quic_config: config,
+            keylog: keylog,
             conn_id_seed: conn_id_seed,
             clients: ClientMap::new(),
         }
