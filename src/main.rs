@@ -101,6 +101,65 @@ impl QuicServer {
         Ok(Client { conn })
     }
 
+    fn handle_after_established(
+        &mut self,
+        from: SocketAddr,
+        pkt_buf: &mut [u8],
+        conn: &mut quiche::Connection,
+        stream_buf: &mut [u8],
+    ) {
+        let recv_info = quiche::RecvInfo { from: from };
+
+        // Process potentially coalesced packets.
+        let read = match conn.recv(pkt_buf, recv_info) {
+            Ok(v) => v,
+
+            Err(e) => {
+                println!("{} recv failed: {:?}", conn.trace_id(), e);
+                return;
+            }
+        };
+
+        println!("{} processed {} bytes", conn.trace_id(), read);
+
+        if conn.is_in_early_data() || conn.is_established() {
+            // Process all readable streams.
+            for s in conn.readable() {
+                let mut buf: [u8; 65535];
+                while let Ok((read, fin)) = conn.stream_recv(s, stream_buf) {
+                    println!("{} received {} bytes", conn.trace_id(), read);
+
+                    let stream_buf = &stream_buf[..read];
+
+                    println!(
+                        "{} stream {} has {} bytes (fin? {})",
+                        conn.trace_id(),
+                        s,
+                        stream_buf.len(),
+                        fin
+                    );
+
+                    let written = match conn.stream_send(s, stream_buf, true) {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => 0,
+
+                        Err(e) => {
+                            println!("{} stream send failed {:?}", conn.trace_id(), e);
+                            break;
+                        }
+                    };
+                    println!(
+                        "{} write into stream {} {} bytes",
+                        conn.trace_id(),
+                        s,
+                        stream_buf.len(),
+                    );
+                }
+            }
+        }
+    }
+
     fn new() -> QuicServer {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
         config
@@ -152,6 +211,7 @@ impl QuicServer {
 struct EchoServer {
     socket: SOCKET,
     buf: [u8; 65535],
+    stream_buf: [u8; 65535],
     out: [u8; 1350],
     from: OsSocketAddr,
     from_len: i32,
@@ -276,57 +336,13 @@ impl EchoServer {
                 }
             };
 
-        let recv_info = quiche::RecvInfo {
-            from: self.from.into_addr().unwrap(),
-        };
+        self.quic_server.handle_after_established(
+            self.from.into_addr().unwrap(),
+            pkt_buf,
+            &mut client.conn,
+            &mut self.stream_buf
+        );
 
-        // Process potentially coalesced packets.
-        let read = match client.conn.recv(pkt_buf, recv_info) {
-            Ok(v) => v,
-
-            Err(e) => {
-                println!("{} recv failed: {:?}", client.conn.trace_id(), e);
-                return true;
-            }
-        };
-
-        println!("{} processed {} bytes", client.conn.trace_id(), read);
-
-        if client.conn.is_in_early_data() || client.conn.is_established() {
-            // Process all readable streams.
-            for s in client.conn.readable() {
-                while let Ok((read, fin)) = client.conn.stream_recv(s, &mut self.buf) {
-                    println!("{} received {} bytes", client.conn.trace_id(), read);
-
-                    let stream_buf = &self.buf[..read];
-
-                    println!(
-                        "{} stream {} has {} bytes (fin? {})",
-                        client.conn.trace_id(),
-                        s,
-                        stream_buf.len(),
-                        fin
-                    );
-
-                    let written = match client.conn.stream_send(s, stream_buf, true) {
-                        Ok(v) => v,
-
-                        Err(quiche::Error::Done) => 0,
-
-                        Err(e) => {
-                            println!("{} stream send failed {:?}", client.conn.trace_id(), e);
-                            break;
-                        }
-                    };
-                    println!(
-                        "{} write into stream {} {} bytes",
-                        client.conn.trace_id(),
-                        s,
-                        stream_buf.len(),
-                    );
-                }
-            }
-        }
         return true;
     }
 
@@ -437,6 +453,7 @@ impl EchoServer {
         EchoServer {
             socket: socket,
             buf: [0; 65535],
+            stream_buf: [0; 65535],
             out: [0; 1350],
             from: OsSocketAddr::new(),
             from_len: 0,
