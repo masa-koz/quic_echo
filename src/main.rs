@@ -239,7 +239,7 @@ struct EchoServer {
 }
 
 impl EchoServer {
-    fn recv(&mut self) -> EchoServerResult<()> {
+    fn recv_quic_packets(&mut self) -> EchoServerResult<()> {
         loop {
             if !self.recving {
                 match recvfrom(
@@ -279,9 +279,9 @@ impl EchoServer {
             }
             self.recv_len = cbTransfer;
             println!("WSARecvFrom()'s cbTransfer={}", cbTransfer);
-            match self.process_packets() {
+            match self.process_quic_packets() {
                 Ok(()) => {
-                    self.send_packets();
+                    self.send_quic_packets();
                     self.remove_closed_connections();
                 }
                 Err(EchoServerError::Fatal) => {
@@ -315,7 +315,7 @@ impl EchoServer {
         Ok(())
     }
 
-    fn send_finish(&mut self) -> EchoServerResult<()> {
+    fn send_quic_packets_completed(&mut self) -> EchoServerResult<()> {
         assert!(self.sending);
 
         let mut cbTransfer = 0;
@@ -337,7 +337,7 @@ impl EchoServer {
         Ok(())
     }
 
-    fn process_packets(&mut self) -> EchoServerResult<()> {
+    fn process_quic_packets(&mut self) -> EchoServerResult<()> {
         let pkt_buf = &mut self.buf[..(self.recv_len as usize)];
         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
@@ -414,7 +414,7 @@ impl EchoServer {
         Ok(())
     }
 
-    fn send_packets(&mut self) -> EchoServerResult<()> {
+    fn send_quic_packets(&mut self) -> EchoServerResult<()> {
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
@@ -767,11 +767,11 @@ fn main() -> Result<()> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4567);
     let mut server1 = EchoServer::new(addr);
 
-    if let Err(EchoServerError::Fatal) = server.recv() {
-        panic!("EchoServer::recv()");
+    if let Err(EchoServerError::Fatal) = server.recv_quic_packets() {
+        panic!("EchoServer::recv_quic_packets()");
     }
-    if let Err(EchoServerError::Fatal) = server1.recv() {
-        panic!("EchoServer::recv()");
+    if let Err(EchoServerError::Fatal) = server1.recv_quic_packets() {
+        panic!("EchoServer::recv_quic_packets()");
     }
 
     loop {
@@ -785,24 +785,24 @@ fn main() -> Result<()> {
         match unsafe { WaitForMultipleObjects(4, handles.as_ptr(), false, INFINITE) } {
             0 => {
                 println!("server recv");
-                if let Err(EchoServerError::Fatal) = server.recv() {
-                    panic!("EchoServer::recv()");
+                if let Err(EchoServerError::Fatal) = server.recv_quic_packets() {
+                    panic!("EchoServer::recv_quic_packets()");
                 }
             }
             1 => {
-                if let Err(EchoServerError::Fatal) = server1.recv() {
-                    panic!("EchoServer::recv()");
+                if let Err(EchoServerError::Fatal) = server1.recv_quic_packets() {
+                    panic!("EchoServer::recv_quic_packets()");
                 }
             }
             2 => {
                 println!("server send finish");
-                if let Err(EchoServerError::Fatal) = server.send_finish() {
-                    panic!("EchoServer::send_finish()");
+                if let Err(EchoServerError::Fatal) = server.send_quic_packets_completed() {
+                    panic!("EchoServer::send_quic_packets_completed()");
                 }
             }
             3 => {
                 println!("server1 send finish");
-                if let Err(EchoServerError::Fatal) = server1.send_finish() {
+                if let Err(EchoServerError::Fatal) = server1.send_quic_packets_completed() {
                     panic!("EchoServer::senf_finish()");
                 }
             }
