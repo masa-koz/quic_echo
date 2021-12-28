@@ -214,6 +214,7 @@ enum EchoServerError {
     Abort,
     RecvPending,
     SendPending,
+    Fatal,
 }
 
 type EchoServerResult<T> = std::result::Result<T, EchoServerError>;
@@ -236,10 +237,12 @@ struct EchoServer {
 }
 
 impl EchoServer {
+    fn service(&mut self) {}
+
     fn recv(&mut self) -> EchoServerResult<()> {
         loop {
             if !self.recving {
-                if !recvfrom(
+                match recvfrom(
                     self.socket,
                     &mut self.buf,
                     65535,
@@ -247,8 +250,15 @@ impl EchoServer {
                     &mut self.from_len,
                     &mut self.recv_overlapped,
                 ) {
-                    self.recving = true;
-                    return Err(EchoServerError::RecvPending);
+                    Ok(read) => {
+                        if read == 0 {
+                            self.recving = true;
+                            return Err(EchoServerError::RecvPending);
+                        }
+                    }
+                    Err(_) => {
+                        return Err(EchoServerError::Fatal);
+                    }
                 }
             }
             self.recving = false;
@@ -343,18 +353,28 @@ impl EchoServer {
                     | Err(QuicServerError::StatelessRetry)
                     | Err(QuicServerError::ProtocolError) => {
                         if !self.sending {
-                            if !sendto(
+                            match sendto(
                                 self.socket,
                                 &mut self.out,
                                 self.send_len as u32,
                                 self.from.into(),
                                 &mut self.send_overlapped,
                             ) {
-                                self.sending = true;
-                                return Err(EchoServerError::SendPending);
+                                Ok(written) => {
+                                    if written > 0 {
+                                        return Ok(());
+                                    } else {
+                                        self.sending = true;
+                                        return Err(EchoServerError::SendPending);
+                                    }
+                                }
+                                Err(_) => {
+                                    return Err(EchoServerError::Abort);
+                                }
                             }
+                        } else {
+                            return Err(EchoServerError::SendPending);
                         }
-                        return Ok(());
                     }
                     Err(_) => {
                         return Err(EchoServerError::Discarded);
@@ -401,19 +421,31 @@ impl EchoServer {
                 };
 
                 if !self.sending {
-                    if !sendto(
+                    match sendto(
                         self.socket,
                         &mut self.out,
                         write as u32,
                         send_info.to.into(),
                         &mut self.send_overlapped,
                     ) {
-                        self.sending = true;
-                        return Err(EchoServerError::SendPending);
+                        Ok(written) => {
+                            if written > 0 {
+                                println!("{} written {} bytes", client.conn.trace_id(), written);
+                            } else {
+                                println!(
+                                    "{} will be written {} bytes",
+                                    client.conn.trace_id(),
+                                    write
+                                );
+                                self.sending = true;
+                                return Err(EchoServerError::SendPending);
+                            }
+                        }
+                        Err(_) => {
+                            return Err(EchoServerError::Fatal);
+                        }
                     }
                 }
-
-                println!("{} written {} bytes", client.conn.trace_id(), write);
             }
         }
         Ok(())
@@ -564,6 +596,33 @@ fn validate_token<'a>(
     Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
+fn wsa_startup() -> Result<()> {
+    let wVersionRequested: u16 = 2 << 8 | 2;
+    let mut wsaData = WSAData {
+        wVersion: 0,
+        wHighVersion: 0,
+        iMaxSockets: 0,
+        iMaxUdpDg: 0,
+        lpVendorInfo: PSTR(std::ptr::null_mut()),
+        szDescription: [0; 257],
+        szSystemStatus: [0; 129],
+    };
+    let ret = unsafe { WSAStartup(wVersionRequested, &mut wsaData) };
+    if ret != 0 {
+        return Err(Error::new(
+            unsafe { std::mem::transmute::<i32, HRESULT>(WSAGetLastError()) },
+            "".into(),
+        ));
+    }
+    return Ok(());
+}
+
+fn wsa_cleanup() {
+    unsafe {
+        WSACleanup();
+    }
+}
+
 fn recvfrom(
     socket: SOCKET,
     buf: &mut [u8],
@@ -571,7 +630,7 @@ fn recvfrom(
     from: &mut OsSocketAddr,
     fromlen: &mut i32,
     overlapped: &mut OVERLAPPED,
-) -> bool {
+) -> Result<usize> {
     let mut wsabuf = WSABUF {
         len: buflen,
         buf: PSTR(buf.as_mut_ptr()),
@@ -597,17 +656,29 @@ fn recvfrom(
     };
     if ret == 0 {
         let ret = unsafe { WaitForSingleObject(overlapped.hEvent, 0) };
-        assert!(ret == WAIT_OBJECT_0);
-        return true;
+        match ret {
+            WAIT_OBJECT_0 => {
+                return Ok(numberOfBytesRecvd as usize);
+            }
+            _ => {
+                return Err(Error::new(
+                    unsafe { std::mem::transmute::<u32, HRESULT>(ret) },
+                    "".into(),
+                ));
+            }
+        }
     } else {
         let ret = unsafe { WSAGetLastError() };
         match ret {
             WSA_IO_PENDING => {
                 println!("WSARecvFrom() return WSA_IO_PENDING");
-                return false;
+                return Ok(0);
             }
             _ => {
-                panic!("WSARecvFrom()={}", ret);
+                return Err(Error::new(
+                    unsafe { std::mem::transmute::<i32, HRESULT>(ret) },
+                    "".into(),
+                ));
             }
         }
     }
@@ -619,7 +690,7 @@ fn sendto(
     numberOfBytesSend: u32,
     to: OsSocketAddr,
     overlapped: &mut OVERLAPPED,
-) -> bool {
+) -> Result<usize> {
     let mut wsabuf = WSABUF {
         len: numberOfBytesSend,
         buf: PSTR(out.as_mut_ptr()),
@@ -642,40 +713,37 @@ fn sendto(
     };
     if ret == 0 {
         let ret = unsafe { WaitForSingleObject(overlapped.hEvent, 0) };
-        assert!(ret == WAIT_OBJECT_0);
         println!("WSASend()'s numberofbytessent={}", numberofbytessent);
-        return true;
+        match ret {
+            WAIT_OBJECT_0 => {
+                return Ok(numberofbytessent as usize);
+            }
+            _ => {
+                return Err(Error::new(
+                    unsafe { std::mem::transmute::<u32, HRESULT>(ret) },
+                    "".into(),
+                ));
+            }
+        }
     } else {
         let ret = unsafe { WSAGetLastError() };
         match ret {
             WSA_IO_PENDING => {
                 println!("WSASendTo() return WSA_IO_PENDING");
-                return false;
+                return Ok(0);
             }
             _ => {
-                panic!("WSASendTo()={}", ret);
+                return Err(Error::new(
+                    unsafe { std::mem::transmute::<i32, HRESULT>(ret) },
+                    "".into(),
+                ));
             }
         }
     }
 }
 
 fn main() -> Result<()> {
-    unsafe {
-        let wVersionRequested: u16 = 2 << 8 | 2;
-        let mut wsaData = WSAData {
-            wVersion: 0,
-            wHighVersion: 0,
-            iMaxSockets: 0,
-            iMaxUdpDg: 0,
-            lpVendorInfo: PSTR(std::ptr::null_mut()),
-            szDescription: [0; 257],
-            szSystemStatus: [0; 129],
-        };
-        let ret = WSAStartup(wVersionRequested, &mut wsaData);
-        if ret != 0 {
-            panic!("WSAStartup()");
-        }
-    }
+    wsa_startup();
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4443);
     let mut server = EchoServer::new(addr);
@@ -716,11 +784,12 @@ fn main() -> Result<()> {
             }
             _ => {
                 println!("error");
+                break;
             }
         }
     }
-    unsafe {
-        WSACleanup();
-    }
+
+    wsa_cleanup();
+
     Ok(())
 }
