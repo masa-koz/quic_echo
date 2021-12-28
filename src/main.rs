@@ -16,6 +16,7 @@ struct Client {
 }
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
+#[derive(Debug)]
 enum QuicServerError {
     VersionNegotiation,
     StatelessRetry,
@@ -209,6 +210,7 @@ impl QuicServer {
     }
 }
 
+#[derive(Debug)]
 enum EchoServerError {
     Discarded,
     Abort,
@@ -237,8 +239,6 @@ struct EchoServer {
 }
 
 impl EchoServer {
-    fn service(&mut self) {}
-
     fn recv(&mut self) -> EchoServerResult<()> {
         loop {
             if !self.recving {
@@ -265,7 +265,7 @@ impl EchoServer {
 
             let mut cbTransfer = 0;
             let mut dwFlags = 0;
-            unsafe {
+            let ret = unsafe {
                 WSAGetOverlappedResult(
                     self.socket,
                     &self.recv_overlapped,
@@ -274,6 +274,9 @@ impl EchoServer {
                     &mut dwFlags,
                 )
             };
+            if !ret.as_bool() {
+                return Err(EchoServerError::Fatal);
+            }
             self.recv_len = cbTransfer;
             println!("WSARecvFrom()'s cbTransfer={}", cbTransfer);
             match self.process_packets() {
@@ -281,24 +284,34 @@ impl EchoServer {
                     self.send_packets();
                     self.remove_closed_connections();
                 }
+                Err(EchoServerError::Fatal) => {
+                    return Err(EchoServerError::Fatal);
+                }
                 Err(EchoServerError::Discarded) => {
                     self.remove_closed_connections();
                     continue;
                 }
-                Err(EchoServerError::SendPending) | Err(_) => {
+                Err(EchoServerError::Abort) | Err(EchoServerError::SendPending) => {
                     self.remove_closed_connections();
-                    recvfrom(
-                        self.socket,
-                        &mut self.buf,
-                        65535,
-                        &mut self.from,
-                        &mut self.from_len,
-                        &mut self.recv_overlapped,
-                    );
+                    break;
+                }
+                Err(_) => {
+                    self.remove_closed_connections();
                     break;
                 }
             }
         }
+        if let Err(_) = recvfrom(
+            self.socket,
+            &mut self.buf,
+            65535,
+            &mut self.from,
+            &mut self.from_len,
+            &mut self.recv_overlapped,
+        ) {
+            return Err(EchoServerError::Fatal);
+        }
+
         Ok(())
     }
 
@@ -307,7 +320,7 @@ impl EchoServer {
 
         let mut cbTransfer = 0;
         let mut dwFlags = 0;
-        unsafe {
+        let ret = unsafe {
             WSAGetOverlappedResult(
                 self.socket,
                 &self.send_overlapped,
@@ -316,6 +329,9 @@ impl EchoServer {
                 &mut dwFlags,
             )
         };
+        if !ret.as_bool() {
+            return Err(EchoServerError::Fatal);
+        }
         println!("WSASendTo()'s cbTransfer={}", cbTransfer);
         self.sending = false;
         Ok(())
@@ -369,7 +385,7 @@ impl EchoServer {
                                     }
                                 }
                                 Err(_) => {
-                                    return Err(EchoServerError::Abort);
+                                    return Err(EchoServerError::Fatal);
                                 }
                             }
                         } else {
@@ -743,7 +759,7 @@ fn sendto(
 }
 
 fn main() -> Result<()> {
-    wsa_startup();
+    wsa_startup()?;
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4443);
     let mut server = EchoServer::new(addr);
@@ -751,8 +767,12 @@ fn main() -> Result<()> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4567);
     let mut server1 = EchoServer::new(addr);
 
-    server.recv();
-    server1.recv();
+    if let Err(EchoServerError::Fatal) = server.recv() {
+        panic!("EchoServer::recv()");
+    }
+    if let Err(EchoServerError::Fatal) = server1.recv() {
+        panic!("EchoServer::recv()");
+    }
 
     loop {
         let handles: [HANDLE; 4] = [
@@ -765,19 +785,26 @@ fn main() -> Result<()> {
         match unsafe { WaitForMultipleObjects(4, handles.as_ptr(), false, INFINITE) } {
             0 => {
                 println!("server recv");
-                server.recv();
+                if let Err(EchoServerError::Fatal) = server.recv() {
+                    panic!("EchoServer::recv()");
+                }
             }
             1 => {
-                println!("server1 recv");
-                server1.recv();
+                if let Err(EchoServerError::Fatal) = server1.recv() {
+                    panic!("EchoServer::recv()");
+                }
             }
             2 => {
                 println!("server send finish");
-                server.send_finish();
+                if let Err(EchoServerError::Fatal) = server.send_finish() {
+                    panic!("EchoServer::send_finish()");
+                }
             }
             3 => {
                 println!("server1 send finish");
-                server1.send_finish();
+                if let Err(EchoServerError::Fatal) = server1.send_finish() {
+                    panic!("EchoServer::senf_finish()");
+                }
             }
             WAIT_TIMEOUT => {
                 println!("timeout");
