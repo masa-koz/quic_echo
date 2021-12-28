@@ -237,6 +237,23 @@ impl EchoServer {
                         stream_buf.len(),
                         fin
                     );
+
+                    let written = match client.conn.stream_send(s, stream_buf, true) {
+                        Ok(v) => v,
+            
+                        Err(quiche::Error::Done) => 0,
+            
+                        Err(e) => {
+                            println!("{} stream send failed {:?}", client.conn.trace_id(), e);
+                            break;
+                        },
+                    };
+                    println!(
+                        "{} write into stream {} {} bytes",
+                        client.conn.trace_id(),
+                        s,
+                        stream_buf.len(),
+                    );
                 }
             }
         }
