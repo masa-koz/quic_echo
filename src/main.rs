@@ -24,7 +24,9 @@ struct EchoServer {
     numberOfBytesRecvd: u32,
     numberOfBytesSend: u32,
     recving: bool,
-    overlapped: OVERLAPPED,
+    sending: bool,
+    recv_overlapped: OVERLAPPED,
+    send_overlapped: OVERLAPPED,
     quic_config: quiche::Config,
     conn_id_seed: ring::hmac::Key,
     clients: ClientMap,
@@ -40,47 +42,52 @@ impl EchoServer {
                     65535,
                     &mut self.dest,
                     &mut self.destlen,
-                    &mut self.overlapped,
+                    &mut self.recv_overlapped,
                 ) {
                     self.recving = true;
                     return;
                 }
             }
             self.recving = false;
-    
+
             let mut cbTransfer = 0;
             let mut dwFlags = 0;
             unsafe {
                 WSAGetOverlappedResult(
                     self.socket,
-                    &self.overlapped,
+                    &self.recv_overlapped,
                     &mut cbTransfer,
                     true,
                     &mut dwFlags,
                 )
             };
             self.numberOfBytesRecvd = cbTransfer;
-            println!("cbTransfer={}", cbTransfer);
+            println!("WSARecvFrom's cbTransfer={}", cbTransfer);
             self.process_packets();
             self.send_packets();
         }
     }
 
-    fn process_packets(&mut self) -> bool {
+    fn send_finish(&mut self) {
+        assert!(self.sending);
+
         let mut cbTransfer = 0;
         let mut dwFlags = 0;
         unsafe {
             WSAGetOverlappedResult(
                 self.socket,
-                &self.overlapped,
+                &self.send_overlapped,
                 &mut cbTransfer,
                 true,
                 &mut dwFlags,
             )
         };
-        self.numberOfBytesRecvd = cbTransfer;
-        println!("cbTransfer={}", cbTransfer);
-        let len: usize = cbTransfer as usize;
+        println!("WSASendTo's cbTransfer={}", cbTransfer);
+        self.sending = false;
+    }
+
+    fn process_packets(&mut self) -> bool {
+        let len: usize = self.numberOfBytesRecvd as usize;
         let pkt_buf = &mut self.buf[..len];
         let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
@@ -105,14 +112,17 @@ impl EchoServer {
 
                     let write = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut self.out)
                         .unwrap() as u32;
-                    if sendto(
-                        self.socket,
-                        &mut self.out,
-                        write,
-                        self.dest,
-                        &mut self.overlapped,
-                    ) {
-                        return false;
+                    if !self.sending {
+                        if !sendto(
+                            self.socket,
+                            &mut self.out,
+                            write,
+                            self.dest,
+                            &mut self.send_overlapped,
+                        ) {
+                            self.sending = true;
+                            return false;
+                        }
                     }
                     return true;
                 }
@@ -141,14 +151,17 @@ impl EchoServer {
                     )
                     .unwrap() as u32;
 
-                    if sendto(
-                        self.socket,
-                        &mut self.out,
-                        write,
-                        self.dest,
-                        &mut self.overlapped,
-                    ) {
-                        return false;
+                    if !self.sending {
+                        if !sendto(
+                            self.socket,
+                            &mut self.out,
+                            write,
+                            self.dest,
+                            &mut self.send_overlapped,
+                        ) {
+                            self.sending = true;
+                            return false;
+                        }
                     }
                     return true;
                 }
@@ -253,14 +266,17 @@ impl EchoServer {
                     }
                 };
 
-                if sendto(
-                    self.socket,
-                    &mut self.out,
-                    write as u32,
-                    send_info.to.into(),
-                    &mut self.overlapped,
-                ) {
-                    break;
+                if !self.sending {
+                    if !sendto(
+                        self.socket,
+                        &mut self.out,
+                        write as u32,
+                        self.dest,
+                        &mut self.send_overlapped,
+                    ) {
+                        self.sending = true;
+                        break;
+                    }
                 }
 
                 println!("{} written {} bytes", client.conn.trace_id(), write);
@@ -308,7 +324,19 @@ impl EchoServer {
             )
         };
 
-        let overlapped = OVERLAPPED {
+        let recv_overlapped = OVERLAPPED {
+            Anonymous: OVERLAPPED_0 {
+                Anonymous: OVERLAPPED_0_0 {
+                    Offset: 9,
+                    OffsetHigh: 0,
+                },
+            },
+            hEvent: unsafe { CreateEventA(std::ptr::null_mut(), false, false, None) },
+            Internal: 0,
+            InternalHigh: 0,
+        };
+
+        let send_overlapped = OVERLAPPED {
             Anonymous: OVERLAPPED_0 {
                 Anonymous: OVERLAPPED_0_0 {
                     Offset: 9,
@@ -353,8 +381,10 @@ impl EchoServer {
             destlen: 0,
             numberOfBytesRecvd: 0,
             numberOfBytesSend: 0,
-            overlapped: overlapped,
+            recv_overlapped: recv_overlapped,
+            send_overlapped: send_overlapped,
             recving: false,
+            sending: false,
             quic_config: config,
             conn_id_seed: conn_id_seed,
             clients: ClientMap::new(),
@@ -498,6 +528,7 @@ fn sendto(
     if ret == 0 {
         let ret = unsafe { WaitForSingleObject(overlapped.hEvent, 0) };
         assert!(ret == WAIT_OBJECT_0);
+        println!("WSASend's numberofbytessent={}", numberofbytessent);
         return true;
     } else {
         let ret = unsafe { WSAGetLastError() };
@@ -536,16 +567,19 @@ fn main() -> Result<()> {
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 4567);
     let mut server1 = EchoServer::new(addr);
-    server.overlapped.hEvent.ok()?;
-    server1.overlapped.hEvent.ok()?;
 
     server.recv();
     server1.recv();
 
     loop {
-        let handles: [HANDLE; 2] = [server.overlapped.hEvent, server1.overlapped.hEvent];
+        let handles: [HANDLE; 4] = [
+            server.recv_overlapped.hEvent,
+            server1.recv_overlapped.hEvent,
+            server.send_overlapped.hEvent,
+            server1.send_overlapped.hEvent,
+        ];
 
-        match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), false, INFINITE) } {
+        match unsafe { WaitForMultipleObjects(4, handles.as_ptr(), false, INFINITE) } {
             0 => {
                 println!("server recv");
                 server.recv();
@@ -553,6 +587,14 @@ fn main() -> Result<()> {
             1 => {
                 println!("server1 recv");
                 server1.recv();
+            }
+            2 => {
+                println!("server send finish");
+                server.send_finish();
+            }
+            3 => {
+                println!("server1 send finish");
+                server1.send_finish();
             }
             WAIT_TIMEOUT => {
                 println!("timeout");
