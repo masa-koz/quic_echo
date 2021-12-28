@@ -1,5 +1,5 @@
 [package]
-name = "winsock_sample"
+name = "quic_echo"
 version = "0.1.0"
 edition = "2021"
 
