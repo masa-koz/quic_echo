@@ -348,7 +348,7 @@ impl EchoServer {
 
                     Err(quiche::Error::Done) => {
                         println!("{} done writing", client.conn.trace_id());
-                        return Err(EchoServerError::Abort);
+                        break;
                     }
 
                     Err(e) => {
