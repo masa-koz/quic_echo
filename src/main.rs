@@ -394,12 +394,12 @@ impl EchoServer {
         self.clients.values().filter_map(|c| c.conn.timeout()).min()
     }
 
-    fn remove_closed_connections(&mut self) -> EchoServerResult<()> {
-        // Garbage collect closed connections.
-        // XXX CCされてもなぜか回収されない。quicheのバグ？
-        self.clients.retain(|_, ref mut c| {
-            println!("Collecting garbage: {}", c.conn.trace_id());
+    fn on_timeout(&mut self) {
+        self.clients.values_mut().for_each(|c| c.conn.on_timeout());
+    }
 
+    fn remove_closed_connections(&mut self) -> EchoServerResult<()> {
+        self.clients.retain(|_, ref mut c| {
             if c.conn.is_closed() {
                 println!(
                     "{} connection collected {:?}",
@@ -754,7 +754,7 @@ fn main() -> Result<()> {
             .into_iter()
             .filter_map(|t| t)
             .min();
-        let ret = if timeout.is_some() && timeout.unwrap().as_millis() > 0 {
+        let ret = if timeout.is_some() {
             println!("Wait will timeout after {} msec", timeout.unwrap().as_millis());
             unsafe {
                 WaitForMultipleObjects(
@@ -794,6 +794,8 @@ fn main() -> Result<()> {
             }
             WAIT_TIMEOUT => {
                 println!("timeout");
+                server.on_timeout(); // XXX
+                server1.on_timeout(); // XXX
             }
             _ => {
                 println!("error");
